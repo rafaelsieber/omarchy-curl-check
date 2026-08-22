@@ -9,7 +9,7 @@ Piping installers straight into bash is everywhere (`curl -fsSL https://get.some
 ## What it does
 
 1. You paste an install command (or just the script URL) — it prefills from your clipboard when it already looks like one.
-2. It downloads the script **without executing it** (2 MB cap, refuses non-text content).
+2. It downloads the script **without executing it** — https only, every redirect hop checked against private/internal addresses, refuses non-text content. The script is always reviewed **in full**, never truncated: everything that runs is everything that was reviewed. Above 100 KB it warns you first that a full review will use more of your agent's tokens and take longer; above 500 KB it refuses (too big to review reliably).
 3. Your default coding agent (`omarchy default agent` — Claude Code, opencode, codex, gemini, crush, or copilot) reviews the code for red flags: chained remote code execution, obfuscated payloads, sudo misuse, persistence mechanisms, data exfiltration, destructive commands.
 4. You get a friendly, plain-language report in your system language:
    - **VERDICT: SAFE / CAUTION / DANGER**
@@ -47,6 +47,8 @@ omarchy plugin remove rafaelsieber.curl-check
 ## Notes
 
 - The report language follows your system locale (`$LANG`), falling back to English.
+- The script is passed to the agent as untrusted data inside randomly-tokenized markers, and the agent is instructed to treat manipulation attempts as a DANGER verdict on their own. If the verdict can't be parsed, running requires the same extra confirmation as DANGER.
+- Downloads are https-only and follow redirects manually: each hop's hostname must resolve to public addresses only (no loopback, LAN, link-local or CGNAT ranges), and the vetted address is pinned for the fetch.
 - The verdict comes from an AI review of the script's source. It is a strong extra check, not a guarantee — a DANGER verdict is a red flag you should trust; a SAFE verdict still assumes you got the URL from the tool's official site.
 - The plugin's service component only runs the idempotent integration script (symlink + menu entry). All menu changes live in a clearly marked block in `~/.config/omarchy/extensions/omarchy-menu.jsonc`.
 
