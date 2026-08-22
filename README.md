@@ -1,5 +1,7 @@
 # Curl Check
 
+![Curl Check reviewing the official Ollama installer](preview.png)
+
 **Don't pipe strangers into your shell.** Curl Check adds an *Install → Curl Check* entry to the Omarchy menu that reviews any `curl | bash` install script with your default AI coding agent *before* it runs — and then runs the exact copy that was reviewed.
 
 Piping installers straight into bash is everywhere (`curl -fsSL https://get.sometool.com | bash`), and most of the time it's fine. This plugin makes it easy to check the other times.
