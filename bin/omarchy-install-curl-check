@@ -1,0 +1,175 @@
+#!/bin/bash
+
+# omarchy:summary=Verify a curl|bash installer with the default agent before running it
+# omarchy:args=[command-or-url]
+# omarchy:examples=omarchy-install-curl-check "curl -fsSL https://example.com/install.sh | bash"
+
+set -uo pipefail
+
+MAX_DOWNLOAD_BYTES=2000000
+MAX_ANALYZE_BYTES=150000
+
+die() {
+  gum style --foreground 1 "$1" >&2
+  exit 1
+}
+
+# --- Collect the command or URL -------------------------------------------
+
+input="${*:-}"
+
+if [[ -z $input ]]; then
+  # Prefill from clipboard when it already looks like an install command or URL
+  prefill=""
+  clip=$(wl-paste --no-newline 2>/dev/null || true)
+  if [[ $clip =~ ^(curl|wget|sh\ |bash\ |https?://) ]]; then
+    prefill=$clip
+  fi
+
+  input=$(gum input --width 100 --value "$prefill" \
+    --header "Paste the install command (curl ... | bash) or just the script URL" \
+    --placeholder "curl -fsSL https://example.com/install.sh | bash") || exit 130
+fi
+
+[[ -z $input ]] && exit 0
+
+url=$(grep -oE 'https?://[^"'"'"' |)<>]+' <<<"$input" | head -1)
+[[ -z $url ]] && die "No URL found in: $input"
+
+# Which interpreter the original command pipes into (defaults to bash)
+interpreter="bash"
+[[ $input =~ \|[[:space:]]*(sudo[[:space:]]+)?sh([[:space:]]|$) ]] && interpreter="sh"
+
+# Arguments passed to the piped script, e.g. `| bash -s -- --no-modify-path`
+script_args=()
+if [[ $input =~ -s[[:space:]]+(--[[:space:]]+)?(.+)$ ]]; then
+  read -ra script_args <<<"${BASH_REMATCH[2]}"
+fi
+
+# --- Download the script (without running it) ------------------------------
+
+workdir=$(mktemp -d)
+trap 'rm -rf "$workdir"' EXIT
+script_file="$workdir/install-script"
+
+gum style --foreground 4 "Downloading $url"
+if ! curl -fsSL --max-time 30 --max-filesize "$MAX_DOWNLOAD_BYTES" -o "$script_file" "$url"; then
+  die "Failed to download the script (network error or larger than $((MAX_DOWNLOAD_BYTES / 1000000))MB)"
+fi
+[[ -s $script_file ]] || die "Downloaded script is empty"
+
+mime=$(file -b --mime-type "$script_file")
+case "$mime" in
+text/*) ;;
+*) die "Downloaded content is not a text script ($mime) — refusing to analyze or run it" ;;
+esac
+
+# --- Analyze with the default coding agent ---------------------------------
+
+agent=$(omarchy-default-agent 2>/dev/null || true)
+[[ -z $agent ]] && agent="claude"
+omarchy-cmd-missing "$agent" && die "Default agent '$agent' is not installed. Set one with: omarchy default agent <name>"
+
+prompt_file="$workdir/prompt"
+{
+  cat <<'PROMPT'
+You are a security reviewer. Analyze the shell install script below, which the user is about to run on their Arch Linux (Omarchy) machine. Do not execute anything; just review the code.
+
+Look for: piping further remote code to a shell, obfuscated or encoded payloads, writes outside expected install locations, modifications to shell rc files or PATH, sudo usage and what it is used for, curl/wget to unexpected domains, data exfiltration, cryptominers, persistence mechanisms (systemd units, cron, autostart), and anything destructive (rm -rf on broad paths, disk operations).
+
+Legitimate installers often use sudo, download release binaries, and add themselves to PATH — that alone is not dangerous. Judge overall intent and risk.
+
+Your report is shown to the user in a terminal before they decide whether to run the installer. Write the ENTIRE report in LANGUAGE_PLACEHOLDER — translate the section headers below too; only the VERDICT line stays in English. Write it in a friendly, plain tone — explain like you would to a friend who is not a security expert. No jargon: instead of "appends to ~/.bashrc / modifies PATH", say "adds itself to your terminal setup so you can run the command from anywhere". Mention file paths only when they matter for the decision. No markdown syntax (no **, ##, backticks) — plain text only, it goes straight to a terminal.
+
+Reply in this exact format:
+
+Line 1: "VERDICT: SAFE" or "VERDICT: CAUTION" or "VERDICT: DANGER" (parsed by the tool)
+
+Then exactly these sections:
+
+What this script will do:
+  3 to 6 short bullets (use "•"), in plain language: what gets installed, where, and what it changes on your machine (e.g. "downloads X and puts it in your personal programs folder", "will ask for your admin password to ...").
+
+Keep an eye on:
+  1 to 4 bullets with anything worth the user's attention before saying yes — sudo and what it is used for, things downloaded from other sites, changes outside the usual places, no checksum verification, etc. For CAUTION/DANGER, this is where you explain the suspicious parts and why they worry you. If there is truly nothing, write "• Nothing concerning — this is an ordinary installer."
+
+Bottom line:
+  One friendly sentence with your recommendation (e.g. "Good to go — it's the official X installer." or "I wouldn't run this: it sends your data to an unknown server.").
+
+The script was downloaded from: URL_PLACEHOLDER
+
+--- SCRIPT START ---
+PROMPT
+  head -c "$MAX_ANALYZE_BYTES" "$script_file"
+  echo
+  if [[ $(stat -c%s "$script_file") -gt $MAX_ANALYZE_BYTES ]]; then
+    echo "[NOTE: script truncated for analysis at $MAX_ANALYZE_BYTES bytes]"
+  fi
+  echo "--- SCRIPT END ---"
+} >"$prompt_file"
+
+# Report language follows the system locale, falling back to English
+locale_code="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
+locale_code="${locale_code%%[.@]*}"
+case "$locale_code" in
+"" | C | POSIX | en | en_*) report_language="English" ;;
+*) report_language="the user's system language (locale: $locale_code)" ;;
+esac
+
+sed -i "s|URL_PLACEHOLDER|$url|; s|LANGUAGE_PLACEHOLDER|$report_language|" "$prompt_file"
+
+analysis_file="$workdir/analysis"
+run_agent() {
+  case "$agent" in
+  claude) claude -p <"$prompt_file" ;;
+  opencode) opencode run "$(cat "$prompt_file")" ;;
+  codex) codex exec "$(cat "$prompt_file")" ;;
+  gemini) gemini -p "$(cat "$prompt_file")" ;;
+  crush) crush run "$(cat "$prompt_file")" ;;
+  copilot) copilot -p "$(cat "$prompt_file")" ;;
+  *) "$agent" -p <"$prompt_file" ;;
+  esac
+}
+
+gum spin --title "Reviewing script with $agent..." -- \
+  bash -c "$(declare -f run_agent); agent='$agent'; prompt_file='$prompt_file'; run_agent >'$analysis_file' 2>&1"
+
+[[ -s $analysis_file ]] || die "The agent returned no analysis"
+
+verdict=$(grep -oEm1 'VERDICT: *(SAFE|CAUTION|DANGER)' "$analysis_file" | grep -oE 'SAFE|CAUTION|DANGER' || echo "UNKNOWN")
+
+case "$verdict" in
+SAFE) gum style --border rounded --padding "0 2" --foreground 2 --border-foreground 2 "✓ VERDICT: SAFE" ;;
+CAUTION) gum style --border rounded --padding "0 2" --foreground 3 --border-foreground 3 "⚠ VERDICT: CAUTION" ;;
+DANGER) gum style --border rounded --padding "0 2" --foreground 1 --border-foreground 1 "✗ VERDICT: DANGER" ;;
+*) gum style --border rounded --padding "0 2" --foreground 3 --border-foreground 3 "? VERDICT: UNKNOWN (could not parse agent output)" ;;
+esac
+
+echo
+grep -v 'VERDICT:' "$analysis_file"
+echo
+
+# --- Decide ----------------------------------------------------------------
+
+run_label="Run installer now"
+while true; do
+  choice=$(gum choose --header "What do you want to do?" "$run_label" "View full script" "Abort") || choice="Abort"
+  case "$choice" in
+  "View full script")
+    gum pager <"$script_file"
+    ;;
+  "$run_label")
+    if [[ $verdict == "DANGER" ]]; then
+      gum confirm --default=false "The agent flagged this script as DANGEROUS. Run it anyway?" || continue
+    fi
+    echo
+    gum style --foreground 4 "Running the reviewed copy of the script (exactly what was analyzed)..."
+    "$interpreter" "$script_file" "${script_args[@]}"
+    exit $?
+    ;;
+  *)
+    gum style --foreground 3 "Aborted. Nothing was executed."
+    exit 0
+    ;;
+  esac
+done

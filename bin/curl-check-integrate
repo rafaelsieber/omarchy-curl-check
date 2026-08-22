@@ -1,0 +1,74 @@
+#!/bin/bash
+
+# Integrates Curl Check with the host system (and cleanly undoes it):
+#   install  Link the tool into ~/.local/bin and add the Install > Curl Check
+#            menu entry (idempotent — safe to run on every shell start).
+#   remove   Remove the link and the menu entry.
+
+set -euo pipefail
+
+PLUGIN_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+TOOL="$PLUGIN_DIR/bin/omarchy-install-curl-check"
+BIN_LINK="$HOME/.local/bin/omarchy-install-curl-check"
+MENU_FILE="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
+
+# Managed block markers — everything between them is owned by this plugin.
+MARK_BEGIN="// >>> rafaelsieber.curl-check (managed by the Curl Check plugin, do not edit)"
+MARK_END="// <<< rafaelsieber.curl-check"
+
+remove_menu_block() {
+  [[ -f $MENU_FILE ]] || return 0
+  local tmp
+  tmp=$(mktemp)
+  awk -v b="$MARK_BEGIN" -v e="$MARK_END" '
+    index($0, b) { skip = 1 }
+    !skip { print }
+    index($0, e) { skip = 0 }
+  ' "$MENU_FILE" >"$tmp"
+  mv "$tmp" "$MENU_FILE"
+}
+
+add_menu_block() {
+  mkdir -p "$(dirname "$MENU_FILE")"
+  [[ -f $MENU_FILE ]] || printf '{\n}\n' >"$MENU_FILE"
+  remove_menu_block
+
+  # Insert right after the opening brace. The trailing comma is safe even when
+  # the object is otherwise empty: Omarchy's JSONC parser strips trailing commas.
+  local tmp block
+  tmp=$(mktemp)
+  block=$(mktemp)
+  cat >"$block" <<BLOCK
+  $MARK_BEGIN
+  "install.curlcheck": {"icon":"󰒃","label":"Curl Check","description":"Review a curl|bash install script with the AI agent before running it","aliases":["curlcheck","safe install"],"when":"command -v omarchy-install-curl-check >/dev/null","action":"omarchy-launch-floating-terminal-with-presentation omarchy-install-curl-check"},
+  $MARK_END
+BLOCK
+  awk -v bf="$block" '
+    !inserted && /{/ {
+      print
+      while ((getline line < bf) > 0) print line
+      inserted = 1
+      next
+    }
+    { print }
+  ' "$MENU_FILE" >"$tmp"
+  mv "$tmp" "$MENU_FILE"
+  rm -f "$block"
+}
+
+case "${1:-}" in
+install)
+  mkdir -p "$(dirname "$BIN_LINK")"
+  ln -sf "$TOOL" "$BIN_LINK"
+  add_menu_block
+  ;;
+remove)
+  # Only remove the link if it is ours
+  [[ -L $BIN_LINK && $(readlink "$BIN_LINK") == "$TOOL" ]] && rm -f "$BIN_LINK"
+  remove_menu_block
+  ;;
+*)
+  echo "Usage: curl-check-integrate <install|remove>" >&2
+  exit 1
+  ;;
+esac
