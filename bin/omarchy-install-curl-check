@@ -79,22 +79,19 @@ Look for: piping further remote code to a shell, obfuscated or encoded payloads,
 
 Legitimate installers often use sudo, download release binaries, and add themselves to PATH — that alone is not dangerous. Judge overall intent and risk.
 
-Your report is shown to the user in a terminal before they decide whether to run the installer. Write the ENTIRE report in LANGUAGE_PLACEHOLDER — translate the section headers below too; only the VERDICT line stays in English. Write it in a friendly, plain tone — explain like you would to a friend who is not a security expert. No jargon: instead of "appends to ~/.bashrc / modifies PATH", say "adds itself to your terminal setup so you can run the command from anywhere". Mention file paths only when they matter for the decision. No markdown syntax (no **, ##, backticks) — plain text only, it goes straight to a terminal.
+Your report is shown in a SMALL terminal window before the user decides whether to run the installer, so it must be COMPACT. Write the content in LANGUAGE_PLACEHOLDER, in a friendly, plain tone — like explaining to a friend who is not a security expert. No jargon: instead of "appends to ~/.bashrc / modifies PATH", say "adds itself to your terminal setup so you can run the command from anywhere". No markdown syntax (no **, ##, backticks) — plain text only.
 
-Reply in this exact format:
+Reply in this exact machine-parsed format. Marker lines ("VERDICT:", "== DO ==", "== WATCH ==", "== SUM ==") stay in English; the title after each marker and all content are written in LANGUAGE_PLACEHOLDER:
 
-Line 1: "VERDICT: SAFE" or "VERDICT: CAUTION" or "VERDICT: DANGER" (parsed by the tool)
+VERDICT: SAFE       (or CAUTION or DANGER — always English, parsed by the tool)
+== DO == <title meaning "What this script will do">
+• 2 to 4 bullets: what gets installed, where, what changes. ONE line each, max 85 characters.
+== WATCH == <title meaning "Keep an eye on">
+• 1 to 3 bullets, ONE line each, max 85 characters: what deserves attention before saying yes (sudo, other domains fetched, no checksum, ...). For CAUTION/DANGER, the suspicious findings go here. If truly nothing: one bullet meaning "Nothing concerning — an ordinary installer."
+== SUM == <title meaning "Bottom line">
+One sentence, max 110 characters, with your recommendation (e.g. "Good to go — it's the official X installer." or "Don't run this: it sends your data to an unknown server.").
 
-Then exactly these sections:
-
-What this script will do:
-  3 to 6 short bullets (use "•"), in plain language: what gets installed, where, and what it changes on your machine (e.g. "downloads X and puts it in your personal programs folder", "will ask for your admin password to ...").
-
-Keep an eye on:
-  1 to 4 bullets with anything worth the user's attention before saying yes — sudo and what it is used for, things downloaded from other sites, changes outside the usual places, no checksum verification, etc. For CAUTION/DANGER, this is where you explain the suspicious parts and why they worry you. If there is truly nothing, write "• Nothing concerning — this is an ordinary installer."
-
-Bottom line:
-  One friendly sentence with your recommendation (e.g. "Good to go — it's the official X installer." or "I wouldn't run this: it sends your data to an unknown server.").
+Keep it tight: no blank lines, no text outside this format, bullets start with "• ".
 
 The script was downloaded from: URL_PLACEHOLDER
 
@@ -139,14 +136,44 @@ gum spin --title "Reviewing script with $agent..." -- \
 verdict=$(grep -oEm1 'VERDICT: *(SAFE|CAUTION|DANGER)' "$analysis_file" | grep -oE 'SAFE|CAUTION|DANGER' || echo "UNKNOWN")
 
 case "$verdict" in
+SAFE) verdict_color=2 ;;
+CAUTION | UNKNOWN) verdict_color=3 ;;
+DANGER) verdict_color=1 ;;
+esac
+
+case "$verdict" in
 SAFE) gum style --border rounded --padding "0 2" --foreground 2 --border-foreground 2 "✓ VERDICT: SAFE" ;;
 CAUTION) gum style --border rounded --padding "0 2" --foreground 3 --border-foreground 3 "⚠ VERDICT: CAUTION" ;;
 DANGER) gum style --border rounded --padding "0 2" --foreground 1 --border-foreground 1 "✗ VERDICT: DANGER" ;;
 *) gum style --border rounded --padding "0 2" --foreground 3 --border-foreground 3 "? VERDICT: UNKNOWN (could not parse agent output)" ;;
 esac
 
-echo
-grep -v 'VERDICT:' "$analysis_file"
+# Compact colored rendering of the marker-based report. Falls back to raw
+# output when the agent did not follow the format.
+if grep -q '^== DO ==' "$analysis_file"; then
+  section=""
+  while IFS= read -r line; do
+    case "$line" in
+    VERDICT:*) ;;
+    "== DO =="*) section=do && printf '\n\033[1;36m%s\033[0m\n' "${line#== DO == }" ;;
+    "== WATCH =="*) section=watch && printf '\n\033[1;33m%s\033[0m\n' "${line#== WATCH == }" ;;
+    "== SUM =="*) section=sum && printf '\n\033[1;3%sm%s\033[0m\n' "$verdict_color" "${line#== SUM == }" ;;
+    "") ;;
+    *)
+      text="${line#• }"
+      case "$section" in
+      do) printf '  \033[32m•\033[0m %s\n' "$text" ;;
+      watch) printf '  \033[33m⚠ %s\033[0m\n' "$text" ;;
+      sum) printf '  \033[3%sm%s\033[0m\n' "$verdict_color" "$text" ;;
+      *) printf '%s\n' "$line" ;;
+      esac
+      ;;
+    esac
+  done <"$analysis_file"
+else
+  echo
+  grep -v 'VERDICT:' "$analysis_file"
+fi
 echo
 
 # --- Decide ----------------------------------------------------------------
