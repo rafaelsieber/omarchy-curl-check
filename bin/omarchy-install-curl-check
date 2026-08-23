@@ -47,9 +47,11 @@ url=$(grep -oE 'https?://[^"'"'"' |)<>]+' <<<"$input" | head -1)
 interpreter="bash"
 [[ $input =~ \|[[:space:]]*(sudo[[:space:]]+)?sh([[:space:]]|$) ]] && interpreter="sh"
 
-# Arguments passed to the piped script, e.g. `| bash -s -- --no-modify-path`
+# Arguments passed to the piped script, e.g. `| bash -s -- --no-modify-path`.
+# Only the interpreter side of the pipe is parsed, so an -s that belongs to
+# curl is never mistaken for script arguments.
 script_args=()
-if [[ $input =~ -s[[:space:]]+(--[[:space:]]+)?(.+)$ ]]; then
+if [[ $input == *\|* ]] && [[ ${input##*|} =~ -s[[:space:]]+(--[[:space:]]+)?(.+)$ ]]; then
   read -ra script_args <<<"${BASH_REMATCH[2]}"
 fi
 
@@ -136,6 +138,16 @@ text/*) ;;
 *) die "Downloaded content is not a text script ($mime) — refusing to analyze or run it" ;;
 esac
 
+# Pin the script: this fd keeps referring to the downloaded inode no matter
+# what later happens to the path, and script_sha anchors its content. The
+# prompt is built from the pin, the hash is re-checked after the review and
+# once more immediately before execution, and execution goes through the pin
+# — so a same-UID replacement of the file while the user sits on the
+# decision menu cannot change what runs.
+exec {script_fd}<"$script_file"
+script_pin="/proc/self/fd/$script_fd"
+script_sha=$(sha256sum "$script_pin" | cut -d' ' -f1)
+
 # --- Analyze with the default coding agent ---------------------------------
 
 agent=$(omarchy-default-agent 2>/dev/null || true)
@@ -179,18 +191,26 @@ One sentence, max 110 characters, with your recommendation (e.g. "Good to go —
 Keep it tight: no blank lines, no text outside this format, bullets start with "• ".
 
 The script was downloaded from: URL_PLACEHOLDER
+After your review it would be executed as: INVOCATION_PLACEHOLDER
+Any arguments on that command line are part of what runs and are untrusted too: check which code paths they select in the script (another install mode, channel, version or target).
 
 --- UNTRUSTED SCRIPT NONCE_PLACEHOLDER START ---
 PROMPT
 )
-header=${header//NONCE_PLACEHOLDER/$nonce}
-header=${header//URL_PLACEHOLDER/$url}
-header=${header//LANGUAGE_PLACEHOLDER/$report_language}
+invocation="$interpreter <downloaded-script>"
+if ((${#script_args[@]})); then
+  printf -v quoted_args ' %q' "${script_args[@]}"
+  invocation+=$quoted_args
+fi
+header=${header//NONCE_PLACEHOLDER/"$nonce"}
+header=${header//URL_PLACEHOLDER/"$url"}
+header=${header//INVOCATION_PLACEHOLDER/"$invocation"}
+header=${header//LANGUAGE_PLACEHOLDER/"$report_language"}
 
 prompt_file="$workdir/prompt"
 {
   printf '%s\n' "$header"
-  cat "$script_file"
+  cat "$script_pin"
   echo
   echo "--- UNTRUSTED SCRIPT $nonce END ---"
 } >"$prompt_file"
@@ -222,7 +242,8 @@ prompt_file="$workdir/prompt"
 # shown to the user, who can read the script in full before deciding.
 #
 # Inside the sandbox only $review_dir is writable; the downloaded script and
-# the prompt are read-only, and the script's hash is checked again afterwards.
+# the prompt are read-only, and the script's hash is checked again after the
+# review and once more immediately before execution.
 
 command -v bwrap >/dev/null 2>&1 ||
   die "bubblewrap (bwrap) is required to sandbox the review and is not installed — refusing to review without it"
@@ -231,7 +252,6 @@ review_dir="$workdir/review"
 agent_cwd="$review_dir/cwd"
 analysis_file="$review_dir/analysis"
 mkdir -p "$agent_cwd"
-script_sha=$(sha256sum "$script_file" | cut -d' ' -f1)
 
 config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
 data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
@@ -308,9 +328,31 @@ opencode)
 EOF
   ;;
 crush)
-  overlay_dir "$config_home/crush"
-  overlay_dir "$data_home/crush"
-  # Crush has no allowlist, so disable every built-in tool by name
+  command -v jq >/dev/null 2>&1 ||
+    die "jq is required to strip MCP servers from the crush config — refusing to review without it"
+  crush_config_dir="${CRUSH_GLOBAL_CONFIG:-$config_home/crush}"
+  crush_data_dir="${CRUSH_GLOBAL_DATA:-$data_home/crush}"
+  overlay_dir "$crush_config_dir"
+  overlay_dir "$crush_data_dir"
+  # Crush merges MCP servers from every config layer, and options.disabled_tools
+  # covers built-in tools only — so each config file that can define servers
+  # (system, global, data; see internal/config/load.go lookupConfigs) is
+  # replaced in the sandbox by a copy with its mcp section removed, and the
+  # global crushrc (a shell config that could emit more) is blanked. The cwd
+  # is empty and outside any git tree, so no other config file is picked up.
+  mkdir -p "$review_dir/crush-sanitized"
+  for crush_cfg in /etc/crush/crush.json "$crush_config_dir/crush.json" "$crush_data_dir/crush.json"; do
+    [[ -f $crush_cfg ]] || continue
+    crush_clean="$review_dir/crush-sanitized/${crush_cfg//\//_}"
+    jq 'del(.mcp)' "$crush_cfg" >"$crush_clean" ||
+      die "Could not parse $crush_cfg to remove its MCP servers — refusing to review with crush"
+    sandbox_mounts+=(--ro-bind "$crush_clean" "$crush_cfg")
+  done
+  if [[ -f "$crush_config_dir/crushrc" ]]; then
+    : >"$review_dir/crush-sanitized/empty-crushrc"
+    sandbox_mounts+=(--ro-bind "$review_dir/crush-sanitized/empty-crushrc" "$crush_config_dir/crushrc")
+  fi
+  # No builtin-tool allowlist either, so disable every built-in tool by name
   # (from internal/config/config.go allToolNames()).
   cat >"$agent_cwd/crush.json" <<'EOF'
 {
@@ -391,6 +433,7 @@ for var in LANG LC_ALL LC_MESSAGES XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME 
   OPENAI_API_KEY OPENAI_BASE_URL CODEX_HOME \
   GEMINI_API_KEY GOOGLE_API_KEY GOOGLE_CLOUD_PROJECT GOOGLE_CLOUD_LOCATION GOOGLE_GENAI_USE_VERTEXAI GEMINI_CLI_HOME \
   GITHUB_TOKEN GH_TOKEN COPILOT_MODEL \
+  CRUSH_GLOBAL_CONFIG CRUSH_GLOBAL_DATA \
   OPENCODE_CONFIG OPENCODE_CONFIG_DIR OPENCODE_API_KEY OPENROUTER_API_KEY; do
   [[ -n ${!var:-} ]] && sandbox_env+=(--setenv "$var" "${!var}")
 done
@@ -433,7 +476,7 @@ gum spin --title "Reviewing script with $agent (no tools, sandboxed)..." -- \
   timeout "$REVIEW_TIMEOUT" "${sandbox[@]}" bash "$review_runner"
 [[ $? -eq 124 ]] && die "The review timed out after $((REVIEW_TIMEOUT / 60)) minutes"
 
-[[ $(sha256sum "$script_file" | cut -d' ' -f1) == "$script_sha" ]] ||
+[[ $(sha256sum "$script_pin" | cut -d' ' -f1) == "$script_sha" ]] ||
   die "The downloaded script changed during the review — refusing to continue"
 [[ -s $analysis_file ]] || die "The agent returned no analysis"
 
@@ -487,7 +530,7 @@ while true; do
   choice=$(gum choose --header "What do you want to do?" "$run_label" "View full script" "Abort") || choice="Abort"
   case "$choice" in
   "View full script")
-    gum pager <"$script_file"
+    gum pager <"$script_pin"
     ;;
   "$run_label")
     if [[ $verdict == "DANGER" ]]; then
@@ -495,9 +538,13 @@ while true; do
     elif [[ $verdict == "UNKNOWN" ]]; then
       gum confirm --default=false "The agent's verdict could not be parsed, so this script is effectively UNREVIEWED. Run it anyway?" || continue
     fi
+    # The decision menu can sit open indefinitely, so the pinned content is
+    # verified once more at the last moment before it runs.
+    [[ $(sha256sum "$script_pin" | cut -d' ' -f1) == "$script_sha" ]] ||
+      die "The script changed between the review and execution — refusing to run it"
     echo
     gum style --foreground 4 "Running the reviewed copy of the script (exactly what was analyzed)..."
-    "$interpreter" "$script_file" "${script_args[@]}"
+    "$interpreter" "$script_pin" "${script_args[@]}"
     exit $?
     ;;
   *)
