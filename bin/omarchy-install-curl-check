@@ -199,24 +199,33 @@ prompt_file="$workdir/prompt"
 #
 # The downloaded script is attacker-controlled text, and it is handed to an
 # LLM. Prompt injection cannot be ruled out, so the review must be harmless
-# even if the model is fully talked into "helping" the script. Two layers:
+# even if the model is fully talked into "helping" the script — it must be
+# unable to change anything on the machine AND unable to read anything worth
+# exfiltrating. Two independent layers, and the review fails closed if either
+# cannot be set up:
 #
-#   1. Every agent is invoked with its tools disabled or forced read-only, so
-#      the model cannot run commands, touch files or call MCP servers during
-#      the review. It can only read the prompt and write text.
-#   2. When bubblewrap is available (it is on Omarchy), the agent process runs
-#      in a sandbox: read-only root filesystem, a throwaway overlay on $HOME
-#      (writes are discarded), a fresh /tmp, no access to the user's runtime
-#      dir (so it cannot talk to already-running agent daemons), and only the
-#      network it needs to reach its API. The worst a successful injection can
-#      do is return a wrong verdict — which is still shown to the user, who
-#      can read the script before deciding.
+#   1. Every supported agent is invoked with its tools disabled: no shell, no
+#      file access, no web fetch, no MCP servers. The model can read the
+#      prompt and write text, nothing else. Unsupported agents are refused.
+#   2. The agent process runs in a bubblewrap namespace that does not contain
+#      the user's home: $HOME is an empty tmpfs into which only the agent's
+#      own binary and its own state/credential directories are mounted (as
+#      throwaway overlays, so writes are discarded). /home, /root, /mnt,
+#      /media, /srv, /run, /tmp and /var/tmp are empty too, the rest of the
+#      root filesystem is read-only, the environment is cleared down to an
+#      allowlist, and the process shares only the network (it needs its API).
+#
+# What the reviewer can still read is its own agent's state, which that
+# agent already sends to its own provider; with tools disabled it has no way
+# to read even that, nor to send anything anywhere but its API. The worst a
+# successful injection can do is return a wrong verdict — which is still
+# shown to the user, who can read the script in full before deciding.
 #
 # Inside the sandbox only $review_dir is writable; the downloaded script and
-# the prompt stay read-only, so a compromised review cannot rewrite what gets
-# executed afterwards (the script's hash is checked again anyway). The agent's
-# working directory is an empty directory in there, so even read-only tools
-# (where an agent offers no way to disable them) find nothing to look at.
+# the prompt are read-only, and the script's hash is checked again afterwards.
+
+command -v bwrap >/dev/null 2>&1 ||
+  die "bubblewrap (bwrap) is required to sandbox the review and is not installed — refusing to review without it"
 
 review_dir="$workdir/review"
 agent_cwd="$review_dir/cwd"
@@ -224,11 +233,66 @@ analysis_file="$review_dir/analysis"
 mkdir -p "$agent_cwd"
 script_sha=$(sha256sum "$script_file" | cut -d' ' -f1)
 
+config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+
+# The agent's real binary. It is run by absolute path inside the sandbox, so
+# the user's PATH (and any shim in it) is not needed there.
+agent_bin=$(command -v "$agent") && agent_bin=$(readlink -f "$agent_bin") ||
+  die "Cannot locate the '$agent' binary"
+[[ $(basename "$agent_bin") == mise ]] &&
+  die "'$agent' resolves to a mise shim; activate mise (mise activate) so the real binary is on PATH"
+
+# bwrap arguments that mount the agent's own directories into the empty home
+# and its binary (when it lives under the home) — built per agent below.
+sandbox_mounts=()
+
+# Mount a directory as a throwaway overlay: readable, writes discarded.
+overlay_dir() {
+  [[ -d $1 ]] && sandbox_mounts+=(--overlay-src "$1" --tmp-overlay "$1")
+}
+
+# Mount a writable private copy of a single file.
+copy_file() {
+  [[ -f $1 ]] || return 0
+  local copy="$review_dir/files/${1//\//_}"
+  mkdir -p "$review_dir/files" && cp "$1" "$copy" && sandbox_mounts+=(--bind "$copy" "$1")
+}
+
+# Mount (read-only) the installation directory that contains a binary, when
+# it lives under the home directory — otherwise it is already visible.
+bind_install_dir() {
+  local real=$1 dir
+  [[ $real == "$HOME"/* ]] || return 0
+  case "$real" in
+  */node_modules/*) dir="${real%%/node_modules/*}/node_modules" ;;
+  */mise/installs/*) dir="${real%%/mise/installs/*}/mise/installs"
+    dir="$dir/$(cut -d/ -f1,2 <<<"${real#"$dir"/}")" ;;
+  *) dir=$(dirname "$real") ;;
+  esac
+  sandbox_mounts+=(--ro-bind "$dir" "$dir")
+}
+
+bind_install_dir "$agent_bin"
+node_bin=""
+if head -c 64 "$agent_bin" | grep -q 'node'; then
+  node_bin=$(readlink -f "$(command -v node)") || die "'$agent' needs node, which is not installed"
+  bind_install_dir "$node_bin"
+fi
+
 case "$agent" in
+claude)
+  overlay_dir "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  copy_file "$HOME/.claude.json"
+  ;;
+codex)
+  overlay_dir "${CODEX_HOME:-$HOME/.codex}"
+  ;;
 opencode)
-  # A dedicated agent with every tool hidden and every permission denied.
-  # Read from the cwd, merging with the user's global config, so their
-  # provider setup still applies. --pure skips user plugins.
+  overlay_dir "$data_home/opencode"
+  overlay_dir "$config_home/opencode"
+  # A dedicated agent with every tool hidden and every permission denied,
+  # read from the cwd and merged with the user's config (provider setup).
   cat >"$agent_cwd/opencode.json" <<'EOF'
 {
   "$schema": "https://opencode.ai/config.json",
@@ -244,6 +308,8 @@ opencode)
 EOF
   ;;
 crush)
+  overlay_dir "$config_home/crush"
+  overlay_dir "$data_home/crush"
   # Crush has no allowlist, so disable every built-in tool by name
   # (from internal/config/config.go allToolNames()).
   cat >"$agent_cwd/crush.json" <<'EOF'
@@ -262,6 +328,26 @@ crush)
 }
 EOF
   ;;
+gemini)
+  gemini_home="${GEMINI_CLI_HOME:-$HOME}/.gemini"
+  overlay_dir "$gemini_home"
+  # Gemini's tool control is its policy engine, which reads only the user
+  # tier (~/.gemini/policies). Mount a deny-everything policy over it.
+  mkdir -p "$review_dir/gemini-policies"
+  cat >"$review_dir/gemini-policies/curl-check.toml" <<'EOF'
+[[rule]]
+toolName = "*"
+decision = "deny"
+priority = 999
+EOF
+  sandbox_mounts+=(--ro-bind "$review_dir/gemini-policies" "$gemini_home/policies")
+  ;;
+copilot)
+  overlay_dir "$HOME/.copilot"
+  ;;
+*)
+  die "Reviewing with '$agent' is not supported: only claude, codex, opencode, crush, gemini and copilot can be run with their tools disabled"
+  ;;
 esac
 
 run_agent() {
@@ -270,60 +356,80 @@ run_agent() {
   # entry is capped at 128KB on Linux, and reviewed scripts can be larger.
   case "$agent" in
   claude)
-    claude -p --tools "" --strict-mcp-config --mcp-config '{"mcpServers":{}}' <"$prompt_file"
+    "$agent_bin" -p --tools "" --strict-mcp-config --mcp-config '{"mcpServers":{}}' <"$prompt_file"
     ;;
   codex)
-    codex exec --sandbox read-only --ephemeral --skip-git-repo-check \
-      -c 'mcp_servers={}' -C "$agent_cwd" - <"$prompt_file"
+    "$agent_bin" exec --sandbox read-only --ephemeral --skip-git-repo-check \
+      -c 'features.shell_tool=false' -c 'web_search="disabled"' \
+      -c 'tools.view_image=false' -c 'mcp_servers={}' -C "$agent_cwd" - <"$prompt_file"
     ;;
   opencode)
-    opencode run --pure --agent curl-check-reviewer --dir "$agent_cwd" <"$prompt_file"
+    "$agent_bin" run --pure --agent curl-check-reviewer --dir "$agent_cwd" <"$prompt_file"
     ;;
   crush)
-    crush run --quiet --cwd "$agent_cwd" --data-dir "$review_dir/crush-data" <"$prompt_file"
+    "$agent_bin" run --quiet --cwd "$agent_cwd" --data-dir "$review_dir/crush-data" <"$prompt_file"
     ;;
   gemini)
-    # Plan mode is Gemini's read-only approval mode; -e none drops extensions.
-    gemini --approval-mode=plan -e none -p "$(cat "$prompt_file")"
+    "$agent_bin" --approval-mode=plan -e none -p "$(cat "$prompt_file")"
     ;;
   copilot)
-    copilot -p "$(cat "$prompt_file")" --deny-tool=shell --deny-tool=write --deny-tool=url \
+    "$agent_bin" -p "$(cat "$prompt_file")" --deny-tool=shell --deny-tool=write --deny-tool=url \
       --disable-builtin-mcps --disallow-temp-dir --no-ask-user
-    ;;
-  *)
-    "$agent" -p <"$prompt_file"
     ;;
   esac
 }
 
-# The bubblewrap sandbox described above. $review_dir is the only writable
-# host path; both workdir binds come last so nothing else can shadow them.
+# Environment allowlist: locale, a minimal PATH, XDG locations and the
+# agents' own credential/endpoint variables. Everything else is dropped.
+sandbox_env=(--clearenv --setenv HOME "$HOME" --setenv USER "${USER:-$(id -un)}" --setenv TERM "${TERM:-dumb}")
+sandbox_path="/usr/local/bin:/usr/bin:/bin"
+[[ -n $node_bin ]] && sandbox_path="$(dirname "$node_bin"):$sandbox_path"
+sandbox_env+=(--setenv PATH "$sandbox_path")
+for var in LANG LC_ALL LC_MESSAGES XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME \
+  HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy SSL_CERT_FILE SSL_CERT_DIR \
+  ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_MODEL CLAUDE_CONFIG_DIR \
+  OPENAI_API_KEY OPENAI_BASE_URL CODEX_HOME \
+  GEMINI_API_KEY GOOGLE_API_KEY GOOGLE_CLOUD_PROJECT GOOGLE_CLOUD_LOCATION GOOGLE_GENAI_USE_VERTEXAI GEMINI_CLI_HOME \
+  GITHUB_TOKEN GH_TOKEN COPILOT_MODEL \
+  OPENCODE_CONFIG OPENCODE_CONFIG_DIR OPENCODE_API_KEY OPENROUTER_API_KEY; do
+  [[ -n ${!var:-} ]] && sandbox_env+=(--setenv "$var" "${!var}")
+done
+
+# DNS: /etc/resolv.conf usually points into /run, which is emptied below.
+resolv_dir=$(dirname "$(readlink -f /etc/resolv.conf)")
+
+# Places other than the home that may hold user data: emptied when present
+# (bwrap cannot create a mount point on the read-only root).
+hide_dirs=()
+for dir in /tmp /var/tmp /run /root /home /mnt /media /srv; do
+  [[ -d $dir ]] && hide_dirs+=(--tmpfs "$dir")
+done
+
 sandbox=(
   bwrap --ro-bind / / --dev /dev --proc /proc
-  --tmpfs /tmp --tmpfs "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-  --overlay-src "$HOME" --tmp-overlay "$HOME"
+  "${hide_dirs[@]}"
+  --ro-bind-try "$resolv_dir" "$resolv_dir"
+  --tmpfs "$HOME"
+  "${sandbox_mounts[@]}"
   --ro-bind "$workdir" "$workdir" --bind "$review_dir" "$review_dir"
+  "${sandbox_env[@]}"
   --unshare-all --share-net --die-with-parent --new-session
   --
 )
-spin_title="Reviewing script with $agent (no tools, sandboxed)..."
-if ! command -v bwrap >/dev/null 2>&1 || ! "${sandbox[@]}" true 2>/dev/null; then
-  gum style --foreground 3 "bubblewrap sandbox unavailable — reviewing without it (the agent's tools are still disabled)."
-  sandbox=()
-  spin_title="Reviewing script with $agent (no tools)..."
-fi
+"${sandbox[@]}" true 2>"$review_dir/bwrap-error" ||
+  die "Could not set up the bubblewrap sandbox: $(head -c 300 "$review_dir/bwrap-error")"
 
 # gum spin runs a real command, not a shell function, so the review is
 # written out as a small script carrying the function and its variables.
 review_runner="$workdir/run-review"
 {
   echo '#!/bin/bash'
-  declare -p agent agent_cwd workdir prompt_file analysis_file
+  declare -p agent agent_bin agent_cwd review_dir prompt_file analysis_file
   declare -f run_agent
   echo 'run_agent >"$analysis_file" 2>&1'
 } >"$review_runner"
 
-gum spin --title "$spin_title" -- \
+gum spin --title "Reviewing script with $agent (no tools, sandboxed)..." -- \
   timeout "$REVIEW_TIMEOUT" "${sandbox[@]}" bash "$review_runner"
 [[ $? -eq 124 ]] && die "The review timed out after $((REVIEW_TIMEOUT / 60)) minutes"
 
