@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "rafaelsieber.curl-check",
   "name": "Curl Check",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "Rafael Sieber",
   "license": "MIT",
   "description": "Review curl|bash install scripts with your default AI coding agent before running them, right from the Install menu.",
