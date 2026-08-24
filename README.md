@@ -22,6 +22,8 @@ When you confirm, Curl Check executes the **reviewed copy** of the script (with 
 
 ## Install
 
+Curl Check is listed on the [Omarchy plugin marketplace](https://omarchyplugins.com/plugin.html?id=rafaelsieber.curl-check) — install it from there, or from this repository:
+
 ```bash
 omarchy plugin add https://github.com/rafaelsieber/omarchy-curl-check.git --enable
 ```
